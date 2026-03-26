@@ -1,0 +1,103 @@
+`timescale 1ns / 1ps
+
+// result_sync
+// Wait for whichever inference path is actually selected:
+//   - calm path:     trigger + f3 + lr
+//   - volatile path: trigger + f13 + mlp
+//
+// trigger_valid is a 1-cycle pulse when the selected path is complete.
+// Reset is active-low.
+
+module result_sync (
+    input  wire clk,
+    input  wire rst,              // active-low reset
+
+    input  wire window_valid,     // 1-cycle pulse when a new window starts
+
+    input  wire f3_done,          // compute_f3 finished
+    input  wire f13_done,         // compute_f13 finished
+    input  wire trigger_done,     // compute_trigger finished
+    input  wire lr_done,          // lr_predict finished
+    input  wire mlp_done,         // myproject (MLP) finished
+    input  wire high_volatility,  // decision from compute_trigger
+
+    output reg  trigger_valid
+);
+
+    // Latches for done pulses (some ap_done pulses can be very short)
+    reg trigger_done_r;
+    reg f3_done_r;
+    reg lr_done_r;
+    reg f13_done_r;
+    reg mlp_done_r;
+
+    // Latched regime decision for current window
+    reg hv_latched;
+
+    // Internal "currently processing a window" flag
+    reg active;
+
+    // Delay trigger_done_r by one cycle so hv_latched is stable before path select
+    reg trigger_done_delay;
+    always @(posedge clk) begin
+        if (!rst)
+            trigger_done_delay <= 1'b0;
+        else
+            trigger_done_delay <= trigger_done_r;
+    end
+
+    // Path readiness
+    wire calm_path_ready;
+    wire volatile_path_ready;
+    wire selected_ready;
+
+    assign calm_path_ready     = trigger_done_delay && f3_done_r  && lr_done_r;
+    assign volatile_path_ready = trigger_done_delay && f13_done_r && mlp_done_r;
+
+    // If hv_latched==0 use calm path, else use volatile path
+    assign selected_ready = hv_latched ? volatile_path_ready : calm_path_ready;
+
+    always @(posedge clk) begin
+        if (!rst) begin
+            trigger_done_r <= 1'b0;
+            f3_done_r      <= 1'b0;
+            lr_done_r      <= 1'b0;
+            f13_done_r     <= 1'b0;
+            mlp_done_r     <= 1'b0;
+            hv_latched     <= 1'b0;
+            active         <= 1'b0;
+            trigger_valid  <= 1'b0;
+        end else begin
+            // default output: pulse only when selected path completes
+            trigger_valid <= 1'b0;
+
+            if (window_valid) begin
+                // New window: clear state and start collecting done flags again
+                trigger_done_r <= 1'b0;
+                f3_done_r      <= 1'b0;
+                lr_done_r      <= 1'b0;
+                f13_done_r     <= 1'b0;
+                mlp_done_r     <= 1'b0;
+                hv_latched     <= 1'b0;
+                active         <= 1'b1;
+            end else if (active) begin
+                // Latch completions as they come in
+                if (trigger_done) begin
+                    trigger_done_r <= 1'b1;
+                    hv_latched     <= high_volatility; // lock decision for this window
+                end
+                if (f3_done)  f3_done_r  <= 1'b1;
+                if (lr_done)  lr_done_r  <= 1'b1;
+                if (f13_done) f13_done_r <= 1'b1;
+                if (mlp_done) mlp_done_r <= 1'b1;
+
+                // Fire when the chosen path has all required done flags
+                if (selected_ready) begin
+                    trigger_valid <= 1'b1;
+                    active        <= 1'b0;
+                end
+            end
+        end
+    end
+
+endmodule
