@@ -1,0 +1,263 @@
+`timescale 1ns / 1ps
+
+module tb_adaptive_system;
+
+    // ------------------------------------------------------------
+    // Basic TB I/O
+    // ------------------------------------------------------------
+    reg  Clock_input;
+    reg  Reset_n_input;
+    reg  rx_0;
+
+    wire [0:0]  Dout_0;
+    wire [15:0] PREDICTION_OUTPUT;
+    wire [7:0]  status_leds_0;
+    wire        tx_0;
+    wire        path_used_1;
+
+    // Test vectors: 60 price words per run
+    reg [31:0] test_prices [0:59];
+
+    integer i;
+    integer bit_idx;
+    integer pass_count;
+    integer fail_count;
+    integer wait_cycles;
+
+    // UART timing (115200 baud @ 100 MHz => ~868 clocks per bit)
+    localparam CYCLES_PER_BIT = 868;
+
+    // ------------------------------------------------------------
+    // DUT
+    // ------------------------------------------------------------
+    design_1_wrapper dut (
+        .Clock_input       (Clock_input),
+        .Reset_n_input     (Reset_n_input),
+        .rx_0              (rx_0),
+        .Dout_0            (Dout_0),
+        .PREDICTION_OUTPUT (PREDICTION_OUTPUT),
+        .status_leds_0     (status_leds_0),
+        .tx_0              (tx_0),
+        .path_used_1       (path_used_1)
+    );
+
+    // 100 MHz TB clock
+    initial Clock_input = 1'b0;
+    always #5 Clock_input = ~Clock_input;
+
+    // ------------------------------------------------------------
+    // Debug monitors (kept as-is functionally; useful in long runs)
+    // ------------------------------------------------------------
+    always @(posedge Clock_input) begin
+        if (dut.design_1_i.price_buffer_0.inst.window_valid === 1'b1)
+            $display("TIME %0t: *** WINDOW_VALID ***", $time);
+
+        if (dut.design_1_i.compute_trigger_0.inst.ap_done === 1'b1)
+            $display("TIME %0t: [TRIGGER] done, hv=%0b",
+                     $time, dut.design_1_i.compute_trigger_0.inst.high_volatility);
+
+        if (dut.design_1_i.compute_f3_0.inst.ap_done === 1'b1 &&
+            dut.design_1_i.result_sync_0.inst.active === 1'b1 &&
+            dut.design_1_i.result_sync_0.inst.f3_done_r === 1'b0)
+            $display("TIME %0t: [F3] done (first)", $time);
+
+        if (dut.design_1_i.compute_f13_0.inst.ap_done === 1'b1 &&
+            dut.design_1_i.result_sync_0.inst.active === 1'b1 &&
+            dut.design_1_i.result_sync_0.inst.f13_done_r === 1'b0)
+            $display("TIME %0t: [F13] done (first)", $time);
+
+        if (dut.design_1_i.lr_predict_0.inst.ap_done === 1'b1 &&
+            dut.design_1_i.result_sync_0.inst.active === 1'b1 &&
+            dut.design_1_i.result_sync_0.inst.lr_done_r === 1'b0)
+            $display("TIME %0t: [LR] done, output=0x%04h",
+                     $time, dut.design_1_i.lr_predict_0.inst.layer3_out);
+
+        if (dut.design_1_i.myproject_0.inst.ap_done === 1'b1 &&
+            dut.design_1_i.result_sync_0.inst.active === 1'b1 &&
+            dut.design_1_i.result_sync_0.inst.mlp_done_r === 1'b0)
+            $display("TIME %0t: [MLP] done, output=0x%04h",
+                     $time, dut.design_1_i.myproject_0.inst.layer8_out);
+
+        if (dut.design_1_i.result_sync_0.inst.trigger_valid === 1'b1)
+            $display("TIME %0t: *** TRIGGER_VALID ***", $time);
+    end
+
+    // Track UART interface buffer_ready edges
+    reg prev_br;
+    initial prev_br = 1'b0;
+    always @(posedge Clock_input) begin
+        if (dut.design_1_i.bitcoin_uart_interfa_0.inst.buffer_ready !== prev_br) begin
+            $display("TIME %0t: [UART] buffer_ready: %0b -> %0b",
+                     $time, prev_br, dut.design_1_i.bitcoin_uart_interfa_0.inst.buffer_ready);
+            prev_br <= dut.design_1_i.bitcoin_uart_interfa_0.inst.buffer_ready;
+        end
+    end
+
+    // Track result_sync active transitions
+    reg prev_active;
+    initial prev_active = 1'b0;
+    always @(posedge Clock_input) begin
+        if (dut.design_1_i.result_sync_0.inst.active !== prev_active) begin
+            $display("TIME %0t: [SYNC] active: %0b -> %0b",
+                     $time, prev_active, dut.design_1_i.result_sync_0.inst.active);
+            prev_active <= dut.design_1_i.result_sync_0.inst.active;
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Tasks
+    // ------------------------------------------------------------
+
+    // Send one UART byte, LSB first, 8N1 framing
+    task send_uart_byte;
+        input [7:0] data;
+    begin
+        rx_0 = 1'b0; // start bit
+        repeat (CYCLES_PER_BIT) @(posedge Clock_input);
+
+        for (bit_idx = 0; bit_idx < 8; bit_idx = bit_idx + 1) begin
+            rx_0 = data[bit_idx];
+            repeat (CYCLES_PER_BIT) @(posedge Clock_input);
+        end
+
+        rx_0 = 1'b1; // stop bit
+        repeat (CYCLES_PER_BIT) @(posedge Clock_input);
+
+        // little breathing room between bytes
+        repeat (100) @(posedge Clock_input);
+    end
+    endtask
+
+    // Send 32-bit price as 4 UART bytes (little-endian)
+    task send_price;
+        input [31:0] price;
+    begin
+        send_uart_byte(price[7:0]);
+        send_uart_byte(price[15:8]);
+        send_uart_byte(price[23:16]);
+        send_uart_byte(price[31:24]);
+    end
+    endtask
+
+    // Apply active-low reset
+    task do_reset;
+    begin
+        $display("\nTIME %0t: ===== RESET =====", $time);
+        Reset_n_input = 1'b0;
+        repeat (100) @(posedge Clock_input);
+        Reset_n_input = 1'b1;
+        repeat (100) @(posedge Clock_input);
+        $display("TIME %0t: Reset released", $time);
+    end
+    endtask
+
+    // Send one full window and verify selected path
+    task send_window_and_check;
+        input [255:0] label;
+        input         expected_path; // 0=LR, 1=MLP
+    begin
+        $display("\n========== %0s ==========", label);
+        $display("TIME %0t: Sending 60 prices...", $time);
+
+        for (i = 0; i < 60; i = i + 1) begin
+            send_price(test_prices[i]);
+
+            if (i == 0)
+                $display("  Price[0]  = 0x%08h (lower16=0x%04h)",
+                         test_prices[i], test_prices[i][15:0]);
+
+            if (i == 59)
+                $display("  Price[59] = 0x%08h (lower16=0x%04h)",
+                         test_prices[i], test_prices[i][15:0]);
+        end
+
+        $display("TIME %0t: All prices sent. Waiting 50000 cycles...", $time);
+
+        for (wait_cycles = 0; wait_cycles < 50000; wait_cycles = wait_cycles + 1) begin
+            @(posedge Clock_input);
+
+            if (wait_cycles == 100 ||
+                wait_cycles == 1000 ||
+                wait_cycles == 10000 ||
+                wait_cycles == 49999) begin
+                $display("  Cycle %0d: path=%b pred=%h active=%b",
+                         wait_cycles,
+                         path_used_1,
+                         PREDICTION_OUTPUT,
+                         dut.design_1_i.result_sync_0.inst.active);
+            end
+        end
+
+        $display("");
+        $display("  FINAL: path_used=%b  prediction=0x%04h  status_leds=0x%02h",
+                 path_used_1, PREDICTION_OUTPUT, status_leds_0);
+
+        if (path_used_1 == expected_path) begin
+            $display("  >>> PASS (expected %0s, got %0s)",
+                     expected_path ? "MLP" : "LR",
+                     path_used_1   ? "MLP" : "LR");
+            pass_count = pass_count + 1;
+        end
+        else begin
+            $display("  >>> FAIL (expected %0s, got %0s)",
+                     expected_path ? "MLP" : "LR",
+                     path_used_1   ? "MLP" : "LR");
+            fail_count = fail_count + 1;
+        end
+
+        repeat (1000) @(posedge Clock_input);
+    end
+    endtask
+
+    // ------------------------------------------------------------
+    // Main test flow
+    // ------------------------------------------------------------
+    initial begin
+        $display("===================================================");
+        $display("  ADAPTIVE HFT SYSTEM - FINAL VERIFICATION");
+        $display("===================================================");
+
+        pass_count = 0;
+        fail_count = 0;
+        rx_0       = 1'b1; // idle UART line high
+
+        // Test 1: low-volatility dataset -> expect LR path
+        do_reset;
+        $readmemh("test_prices_low_vol.hex", test_prices);
+        send_window_and_check("TEST 1: LOW VOLATILITY", 1'b0);
+
+        // Test 2: high-volatility dataset -> expect MLP path
+        do_reset;
+        $readmemh("test_prices_high_vol.hex", test_prices);
+        send_window_and_check("TEST 2: HIGH VOLATILITY", 1'b1);
+
+        // Test 3: repeat low-vol case
+        do_reset;
+        $readmemh("test_prices_low_vol.hex", test_prices);
+        send_window_and_check("TEST 3: LOW VOL REPEAT", 1'b0);
+
+        // Test 4: repeat high-vol case
+        do_reset;
+        $readmemh("test_prices_high_vol.hex", test_prices);
+        send_window_and_check("TEST 4: HIGH VOL REPEAT", 1'b1);
+
+        $display("\n===================================================");
+        $display("  FINAL RESULTS: %0d PASS, %0d FAIL out of 4 tests", pass_count, fail_count);
+
+        if (fail_count == 0)
+            $display("  ALL TESTS PASSED - READY FOR BITSTREAM");
+        else
+            $display("  FAILURES DETECTED - DO NOT SYNTHESIZE");
+
+        $display("===================================================");
+        $finish;
+    end
+
+    // Global watchdog timeout (prevents hung simulation)
+    initial begin
+        #500_000_000_000;
+        $display("ERROR: Global timeout");
+        $finish;
+    end
+
+endmodule
