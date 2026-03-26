@@ -1,0 +1,32 @@
+module hls_start_controller (
+    input  wire clk,
+    input  wire rst,
+    input  wire trigger,
+    input  wire ap_ready, 
+    input  wire ap_done,
+    output reg  ap_start
+);
+
+    // busy=1 means waiting for completion
+    reg busy;
+
+    always @(posedge clk) begin
+        if (!rst) begin
+            ap_start <= 1'b0;
+            busy     <= 1'b0;
+        end else begin
+            // launch once when trigger arrives and we're idle
+            if (!busy && trigger) begin
+                ap_start <= 1'b1;
+                busy     <= 1'b1;
+            end
+
+            // clear start/busy when block reports done
+            if (busy && ap_done) begin
+                ap_start <= 1'b0;
+                busy     <= 1'b0;
+            end
+        end
+    end
+
+endmodule
